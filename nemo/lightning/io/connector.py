@@ -1,9 +1,12 @@
+import inspect
+import logging
 import os
 import shutil
-from pathlib import Path, PosixPath, WindowsPath
+from pathlib import Path, PosixPath, PurePath, WindowsPath
 from typing import Generic, Optional, Tuple, TypeVar
 
 import pytorch_lightning as pl
+from filelock import FileLock, Timeout
 
 # Dynamically inherit from the correct Path subclass based on the operating system.
 if os.name == 'nt':
@@ -47,6 +50,7 @@ class Connector(BasePath, Generic[SourceT, TargetT]):
     """
 
     default_path = None
+    LOCK_TIMEOUT = 1200
 
     def init(self) -> TargetT:
         raise NotImplementedError()
@@ -63,13 +67,37 @@ class Connector(BasePath, Generic[SourceT, TargetT]):
 
     def __call__(self, output_path: Optional[Path] = None, overwrite: bool = False) -> Path:
         _output_path = output_path or self.local_path()
+        lock_path = _output_path.with_suffix(_output_path.suffix + '.lock')
+        lock = FileLock(lock_path)
 
-        if overwrite and _output_path.exists():
-            shutil.rmtree(_output_path)
+        # Check if the lock file exists and set overwrite to False if it does
+        if lock_path.exists():
+            overwrite = False
 
-        if not _output_path.exists():
-            to_return = self.apply(_output_path)
-            _output_path = to_return or _output_path
+        try:
+            with lock.acquire(timeout=self.LOCK_TIMEOUT):
+                if overwrite and _output_path.exists():
+                    shutil.rmtree(_output_path)
+
+                if not _output_path.exists():
+                    to_return = self.apply(_output_path)
+                    _output_path = to_return or _output_path
+
+        except Timeout:
+            logging.error(f"Timeout occurred while trying to acquire the lock for {_output_path}")
+            raise
+
+        except Exception as e:
+            logging.error(f"An error occurred: {e}")
+            raise
+
+        finally:
+            # Delete the lock file if it exists
+            if lock_path.exists():
+                try:
+                    os.remove(lock_path)
+                except OSError as e:
+                    logging.warning(f"Failed to remove lock file {lock_path}: {e}")
 
         return _output_path
 
@@ -117,6 +145,7 @@ class ModelConnector(Connector, Generic[SourceT, TargetT]):
             pl.Trainer: The trainer configured with the model and strategy.
         """
         from nemo.lightning import MegatronStrategy, Trainer
+        from nemo.lightning._strategy_lib import megatron_lazy_init_context
 
         _trainer = trainer or Trainer(
             devices=1, accelerator="cpu", strategy=MegatronStrategy(store_optimizer_states=False)
@@ -127,21 +156,30 @@ class ModelConnector(Connector, Generic[SourceT, TargetT]):
 
         if not model.state_dict():
             _trainer.strategy.lazy_init = True
-            with _trainer.init_module():
+            with _trainer.init_module(), megatron_lazy_init_context(model.config):
                 model.configure_model()
 
         return _trainer
 
-    def nemo_save(self, output_path: Path, trainer: pl.Trainer) -> None:
+    def nemo_save(self, output_path: Path, trainer: pl.Trainer, dump_io: bool = True) -> None:
         """
         Saves the model's state to the specified path using the trainer's current strategy.
 
         Args:
             output_path (Path): The path where the model checkpoint will be saved.
             trainer (pl.Trainer): The trainer with the strategy to save the model.
+            dump_io (bool): If True, the IO configuration will be saved to the output path.
         """
+        trainer.strategy._setup_optimizers = False
+        trainer.strategy._init_model_parallel = False
         trainer.strategy.setup(trainer)
         trainer.save_checkpoint(output_path)
+
+        from nemo.lightning.io.pl import TrainerContext
+        from nemo.utils.get_rank import is_global_rank_zero
+
+        if is_global_rank_zero() and dump_io:
+            TrainerContext.from_trainer(trainer).io_dump(output_path)
 
     def nemo_load(
         self, path: Path, trainer: Optional[pl.Trainer] = None, cpu: bool = True
@@ -159,10 +197,12 @@ class ModelConnector(Connector, Generic[SourceT, TargetT]):
             Tuple[pl.LightningModule, pl.Trainer]: The loaded model and the trainer configured with the model.
         """
         from nemo.lightning import MegatronStrategy, Trainer, _strategy_lib
-        from nemo.lightning.io.api import load_ckpt
+        from nemo.lightning.io.api import load_context
 
-        model = load_ckpt(path).model
-        _trainer = trainer or Trainer(devices=1, accelerator="cpu" if cpu else "gpu", strategy=MegatronStrategy())
+        model = load_context(path).model
+        _trainer = trainer or Trainer(
+            devices=1, accelerator="cpu" if cpu else "gpu", strategy=MegatronStrategy(ddp="pytorch")
+        )
 
         _trainer.strategy.connect(model)
         _trainer.strategy.setup_environment()
@@ -182,10 +222,28 @@ class ModelConnector(Connector, Generic[SourceT, TargetT]):
 
     def local_path(self, base_path: Optional[Path] = None) -> Path:
         if base_path:
-            _base = base_path
+            _base = Path(base_path)
         else:
             from nemo.lightning.base import NEMO_MODELS_CACHE
 
             _base = Path(NEMO_MODELS_CACHE)
 
+        # If the useu supplied `hf:///path/to/downloaded/my-model/`
+        # then extract the last dir-name (i.e. my-model) and append it to _base
+        if str(self).startswith('/'):
+            return _base / PurePath((str(self))).name
         return _base / str(self).replace("://", "/")
+
+    def on_import_ckpt(self, model: pl.LightningModule):
+        if hasattr(self, "tokenizer"):
+            model.tokenizer = self.tokenizer
+            if hasattr(model, "__io__") and hasattr(self.tokenizer, '__io__'):
+                model.__io__.tokenizer = self.tokenizer.__io__
+
+    def save_hf_tokenizer_assets(self, tokenizer_name_or_path, save_path="/tmp/nemo_tokenizer"):
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
+        # Save tokenizer assets to save_path.
+        tok.save_pretrained(save_path)
+        return save_path

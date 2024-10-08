@@ -29,8 +29,8 @@ from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin, InterCTCMixin, TranscribeConfig
 from nemo.collections.asr.parts.mixins.transcription import TranscriptionReturnType
+from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecoding, CTCDecodingConfig
-from nemo.collections.asr.parts.utils.audio_utils import ChannelSelectorType
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.classes.mixins import AccessMixin
 from nemo.utils import logging, model_utils
@@ -157,7 +157,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
         super()._transcribe_on_end(trcfg)
 
         if hasattr(self, 'ctc_decoder'):
-            self.ctc_decoder.unfreeze()
+            self.ctc_decoder.unfreeze(partial=True)
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
         if self.cur_decoder == "rnnt":
@@ -667,4 +667,10 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
             List of available pre-trained models.
         """
         results = []
+        model = PretrainedModelInfo(
+            pretrained_model_name="parakeet-tdt_ctc-110m",
+            description="For details on this model, please refer to https://ngc.nvidia.com/catalog/models/nvidia:nemo:parakeet-tdt_ctc-110m",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/parakeet-tdt_ctc-110m/versions/v1/files/parakeet-tdt_ctc-110m.nemo",
+        )
+        results.append(model)
         return results

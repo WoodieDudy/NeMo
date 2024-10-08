@@ -118,6 +118,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             Defaults to None.
         conv_dual_mode (bool): specifies if convolution should be dual mode when dual_offline mode is being used. When enables, the left half of the convolution kernel would get masked in streaming cases.
             Defaults to False
+        use_bias (bool): Use bias in all Linear and Conv1d layers from each ConformerLayer to improve activation flow and stabilize training of huge models.
+            Defaults to True.
         dropout (float): the dropout rate used in all layers except the attention layers
             Defaults to 0.1.
         dropout_pre_encoder (float): the dropout rate used before the encoder
@@ -145,6 +147,10 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             Defaults to 1.
         global_attn_separate (bool): whether the q, k, v layers used for global tokens should be separate.
             Defaults to False.
+        use_pytorch_sdpa (bool): use torch sdpa instead of manual attention.
+            Defaults to False.
+        use_pytorch_sdpa_backends (list[str]): list of backend names to use in sdpa. None or empty list means all backends. e.g. ["MATH"]
+            Defaults to None
 
     """
 
@@ -282,6 +288,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         conv_kernel_size=31,
         conv_norm_type='batch_norm',
         conv_context_size=None,
+        use_bias=True,
         dropout=0.1,
         dropout_pre_encoder=0.1,
         dropout_emb=0.1,
@@ -292,6 +299,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         global_tokens: int = 0,
         global_tokens_spacing: int = 1,
         global_attn_separate: bool = False,
+        use_pytorch_sdpa: bool = False,
+        use_pytorch_sdpa_backends=None,
     ):
         super().__init__()
         d_ff = d_model * ff_expansion_factor
@@ -306,6 +315,10 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.global_tokens = global_tokens
         self.global_attn_separate = global_attn_separate
         self.global_tokens_spacing = global_tokens_spacing
+        self.use_pytorch_sdpa = use_pytorch_sdpa
+        if use_pytorch_sdpa_backends is None:
+            use_pytorch_sdpa_backends = []
+        self.use_pytorch_sdpa_backends = use_pytorch_sdpa_backends
 
         # Setting up the att_context_size
         (
@@ -426,6 +439,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 pos_bias_u=pos_bias_u,
                 pos_bias_v=pos_bias_v,
                 att_context_size=self.att_context_size,
+                use_bias=use_bias,
+                use_pytorch_sdpa=self.use_pytorch_sdpa,
+                use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
             )
             self.layers.append(layer)
 
@@ -497,6 +513,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
     def forward(
         self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None
     ):
+        self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
         return self.forward_internal(
             audio_signal,
             length,
@@ -508,8 +525,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
     def forward_internal(
         self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None
     ):
-        self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
-
         if length is None:
             length = audio_signal.new_full(
                 (audio_signal.size(0),), audio_signal.size(-1), dtype=torch.int64, device=audio_signal.device
@@ -675,7 +690,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         """
         self.max_audio_length = max_audio_length
         device = next(self.parameters()).device
-        self.pos_enc.extend_pe(max_audio_length, device)
+        dtype = next(self.parameters()).dtype
+        self.pos_enc.extend_pe(max_audio_length, device, dtype)
 
     def _create_masks(self, att_context_size, padding_length, max_audio_length, offset, device):
         if self.self_attention_model != "rel_pos_local_attn":
@@ -1024,6 +1040,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                         max_cache_len=att_context_size[0],
                         pos_bias_u=None,
                         pos_bias_v=None,
+                        use_pytorch_sdpa=self.use_pytorch_sdpa,
+                        use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
                     )
                 elif self_attention_model == 'rel_pos_local_attn':
                     new_attn = RelPositionMultiHeadAttentionLongformer(
@@ -1034,6 +1052,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                         att_context_size=att_context_size,
                         pos_bias_u=None,
                         pos_bias_v=None,
+                        use_pytorch_sdpa=self.use_pytorch_sdpa,
+                        use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
                     )
                 elif self_attention_model == 'abs_pos':
                     new_attn = MultiHeadAttention(
@@ -1041,6 +1061,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                         n_feat=self._cfg.d_model,
                         dropout_rate=self._cfg.dropout_att,
                         max_cache_len=att_context_size[0],
+                        use_pytorch_sdpa=self.use_pytorch_sdpa,
+                        use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
                     )
                 else:
                     raise ValueError(

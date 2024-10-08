@@ -1,72 +1,38 @@
-import pickle
 from pathlib import Path
 from typing import Any, Callable, Optional, Type, TypeVar
 
 import fiddle as fdl
 import pytorch_lightning as pl
+from fiddle._src.experimental import serialization
 
-from nemo.lightning.io.mixin import ConnectorMixin, ConnT, ModelConnector
-from nemo.lightning.io.pl import TrainerCheckpoint
-
-CkptType = TypeVar("CkptType")
+from nemo.lightning.io.mixin import ConnectorMixin, ConnT, ModelConnector, load
+from nemo.lightning.io.pl import TrainerContext
 
 
-def load(path: Path, output_type: Type[CkptType] = Any) -> CkptType:
+def load_context(path: Path, subpath: Optional[str] = None) -> TrainerContext:
     """
-    Loads a configuration from a pickle file and constructs an object of the specified type.
+    Loads a TrainerContext from a json-file or directory.
 
     Args:
-        path (Path): The path to the pickle file or directory containing 'io.pkl'.
-        output_type (Type[CkptType]): The type of the object to be constructed from the loaded data.
+        path (Path): The path to the json-file or directory containing 'io.json'.
+        subpath (Optional[str]): Subpath to selectively load only specific objects inside the TrainerContext. Defaults to None.
 
     Returns
     -------
-        CkptType: An instance of the specified type constructed from the loaded configuration.
-
-    Raises
-    ------
-        FileNotFoundError: If the specified file does not exist.
+        TrainerContext: The loaded TrainerContext instance.
 
     Example:
-        loaded_model = load("/path/to/model", output_type=MyModel)
+        # Load the entire context
+        checkpoint: TrainerContext = load_ckpt("/path/to/checkpoint")
+
+        # Load a subpath of the context, for eg: model.config
+        checkpoint: TrainerContext = load_ckpt("/path/to/checkpoint", subpath="model.config")
+
     """
-    del output_type  # Just for type-hint
-
-    _path = Path(path)
-    if hasattr(_path, 'is_dir') and _path.is_dir():
-        _path = Path(_path) / "io.pkl"
-    elif hasattr(_path, 'isdir') and _path.isdir:
-        _path = Path(_path) / "io.pkl"
-
-    if not _path.is_file():
-        raise FileNotFoundError(f"No such file: '{_path}'")
-
-    with open(_path, "rb") as f:
-        config = pickle.load(f)
-
-    return fdl.build(config)
+    return load(path, output_type=TrainerContext, subpath=subpath)
 
 
-def load_ckpt(path: Path) -> TrainerCheckpoint:
-    """
-    Loads a TrainerCheckpoint from a pickle file or directory.
-
-    Args:
-        path (Path): The path to the pickle file or directory containing 'io.pkl'.
-
-    Returns
-    -------
-        TrainerCheckpoint: The loaded TrainerCheckpoint instance.
-
-    Example:
-        checkpoint: TrainerCheckpoint = load_ckpt("/path/to/checkpoint")
-    """
-    return load(path, output_type=TrainerCheckpoint)
-
-
-def model_importer(
-    target: Type[ConnectorMixin], ext: str, default_path: Optional[str] = None
-) -> Callable[[Type[ConnT]], Type[ConnT]]:
+def model_importer(target: Type[ConnectorMixin], ext: str) -> Callable[[Type[ConnT]], Type[ConnT]]:
     """
     Registers an importer for a model with a specified file extension and an optional default path.
 
@@ -81,16 +47,14 @@ def model_importer(
         to the model class.
 
     Example:
-        @model_importer(MyModel, "hf", default_path="path/to/default")
+        @model_importer(MyModel, "hf")
         class MyModelHfImporter(io.ModelConnector):
             ...
     """
-    return target.register_importer(ext, default_path=default_path)
+    return target.register_importer(ext)
 
 
-def model_exporter(
-    target: Type[ConnectorMixin], ext: str, default_path: Optional[str] = None
-) -> Callable[[Type[ConnT]], Type[ConnT]]:
+def model_exporter(target: Type[ConnectorMixin], ext: str) -> Callable[[Type[ConnT]], Type[ConnT]]:
     """
     Registers an exporter for a model with a specified file extension and an optional default path.
 
@@ -105,11 +69,11 @@ def model_exporter(
         to the model class.
 
     Example:
-        @model_exporter(MyModel, "hf", default_path="path/to/default")
+        @model_exporter(MyModel, "hf")
         class MyModelHFExporter(io.ModelConnector):
             ...
     """
-    return target.register_exporter(ext, default_path=default_path)
+    return target.register_exporter(ext)
 
 
 def import_ckpt(
@@ -161,17 +125,19 @@ def import_ckpt(
 
     Example:
         model = Mistral7BModel()
-        imported_path = import_ckpt(model, "hf")
+        imported_path = import_ckpt(model, "hf://mistralai/Mistral-7B-v0.1")
     """
     if not isinstance(model, ConnectorMixin):
         raise ValueError("Model must be an instance of ConnectorMixin")
 
     importer: ModelConnector = model.importer(source)
-    return importer(overwrite=overwrite, output_path=output_path)
+    ckpt_path = importer(overwrite=overwrite, output_path=output_path)
+    importer.on_import_ckpt(model)
+    return ckpt_path
 
 
 def load_connector_from_trainer_ckpt(path: Path, target: str) -> ModelConnector:
-    model: pl.LightningModule = load_ckpt(path).model
+    model: pl.LightningModule = load_context(path).model
 
     if not isinstance(model, ConnectorMixin):
         raise ValueError("Model must be an instance of ConnectorMixin")
